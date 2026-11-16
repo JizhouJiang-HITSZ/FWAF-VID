@@ -1,304 +1,264 @@
 #!/usr/bin/env python3
+"""Export ROS image topics to fixed-frame-rate videos with ffmpeg.
 
-#function:extract video or image from rosbag
+Based on the original rosbag2video script by Maximilian Laiacker and Abel Gabor.
+"""
 
-import roslib
-#roslib.load_manifest('rosbag')
-import rospy
-import rosbag
-import sys, getopt
-import os
-from sensor_msgs.msg import CompressedImage
-from sensor_msgs.msg import Image
-import cv2
+import argparse
+from contextlib import ExitStack
+import math
+from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
-import numpy as np
-
-import shlex, subprocess
+from file_utils import atomic_output, validate_paths
 
 MJPEG_VIDEO = 1
 RAWIMAGE_VIDEO = 2
-VIDEO_CONVERTER_TO_USE = "ffmpeg" # or you may want to use "avconv"
+VIDEO_CONVERTER_TO_USE = 'ffmpeg'
+
+
+def positive_float(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError('must be finite and greater than zero')
+    return value
+
+
+def nonnegative_float(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError('must be finite and nonnegative')
+    return value
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('bags', nargs='+')
+    parser.add_argument('--fps', type=positive_float, default=25.0)
+    parser.add_argument('-r', '--rate', type=positive_float, default=1.0)
+    parser.add_argument('-o', '--ofile', default='', help='explicit output; requires one bag and --topic')
+    parser.add_argument('-t', '--topic', default='')
+    parser.add_argument('-p', '--prefix', help='output filename prefix (one bag only)')
+    parser.add_argument('-s', action='store_true', help='display images while converting')
+    parser.add_argument('-v', action='store_true', help='show output filenames')
+    parser.add_argument('--start', type=nonnegative_float, help='start ROS timestamp in seconds')
+    parser.add_argument('--end', type=nonnegative_float, help='end ROS timestamp in seconds')
+    return parser
+
 
 def print_help():
-    print('rosbag2video.py [--fps 25] [--rate 1] [-o outputfile] [-v] [-s] [-t topic] bagfile1 [bagfile2] ...')
-    print()
-    print('Converts image sequence(s) in ros bag file(s) to video file(s) with fixed frame rate using',VIDEO_CONVERTER_TO_USE)
-    print(VIDEO_CONVERTER_TO_USE,'needs to be installed!')
-    print()
-    print('--fps   Sets FPS value that is passed to',VIDEO_CONVERTER_TO_USE)
-    print('        Default is 25.')
-    print('-h      Displays this help.')
-    print('--ofile (-o) sets output file name.')
-    print('        If no output file name (-o) is given the filename \'<prefix><topic>.mp4\' is used and default output codec is h264.')
-    print('        Multiple image topics are supported only when -o option is _not_ used.')
-    print('        ',VIDEO_CONVERTER_TO_USE,' will guess the format according to given extension.')
-    print('        Compressed and raw image messages are supported with mono8 and bgr8/rgb8/bggr8/rggb8 formats.')
-    print('--rate  (-r) You may slow down or speed up the video.')
-    print('        Default is 1.0, that keeps the original speed.')
-    print('-s      Shows each and every image extracted from the rosbag file (cv_bride is needed).')
-    print('--topic (-t) Only the images from topic "topic" are used for the video output.')
-    print('-v      Verbose messages are displayed.')
-    print('--prefix (-p) set a output file name prefix othervise \'bagfile1\' is used (if -o is not set).')
-    print('--start Optional start time in seconds.')
-    print('--end   Optional end time in seconds.')
+    make_parser().print_help()
 
 
+def prepare_image(msg):
+    """Return packed image bytes and an ffmpeg pixel format; remove ROS row padding."""
+    if hasattr(msg, 'format'):
+        import cv2
+        import numpy as np
+        image = cv2.imdecode(np.frombuffer(msg.data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError('Unable to decode compressed image')
+        if image.ndim == 2:
+            if image.dtype == np.uint8:
+                pix_fmt = 'gray'
+            elif image.dtype == np.uint16:
+                image = image.astype('<u2', copy=False)
+                pix_fmt = 'gray16le'
+            else:
+                raise ValueError('Unsupported compressed image depth')
+        elif image.dtype == np.uint8 and image.shape[2] in (3, 4):
+            pix_fmt = 'bgr24' if image.shape[2] == 3 else 'bgra'
+        else:
+            raise ValueError('Unsupported compressed image format')
+        height, width = image.shape[:2]
+        return SimpleNamespace(data=image.tobytes(), width=width, height=height), pix_fmt
 
-class RosVideoWriter():
-    def __init__(self, fps=25.0, rate=1.0, topic="", output_filename ="", display= False, verbose = False, start = rospy.Time(0), end = rospy.Time(sys.maxsize)):
-        self.opt_topic = topic
-        self.opt_out_file = output_filename
-        self.opt_verbose = verbose
-        self.opt_display_images = display
-        self.opt_start = start
-        self.opt_end = end
-        self.rate = rate
-        self.fps = fps
-        self.opt_prefix= None
-        self.t_first={}
-        self.t_file={}
-        self.t_video={}
-        self.p_avconv = {}
+    formats = {
+        'mono8': ('gray', 1), '8UC1': ('gray', 1),
+        'bgr8': ('bgr24', 3), 'rgb8': ('rgb24', 3),
+        'bgra8': ('bgra', 4), 'rgba8': ('rgba', 4),
+        'bayer_bggr8': ('bayer_bggr8', 1), 'bayer_rggb8': ('bayer_rggb8', 1),
+        'bggr8': ('bayer_bggr8', 1), 'rggb8': ('bayer_rggb8', 1),
+        'mono16': ('gray16be' if msg.is_bigendian else 'gray16le', 2),
+        '16UC1': ('gray16be' if msg.is_bigendian else 'gray16le', 2),
+        'yuv422': ('uyvy422', 2),
+    }
+    if msg.encoding not in formats:
+        raise ValueError(f'Unsupported raw image encoding: {msg.encoding}')
+    pix_fmt, bytes_per_pixel = formats[msg.encoding]
+    width, height = msg.width, msg.height
+    row_bytes = width * bytes_per_pixel
+    if width <= 0 or height <= 0 or msg.step < row_bytes or len(msg.data) != msg.step * height:
+        raise ValueError('Invalid image dimensions, step, or data length')
+    if msg.encoding == 'yuv422' and width % 2:
+        raise ValueError('yuv422 requires an even image width')
+    data = bytes(msg.data)
+    if msg.step != row_bytes:
+        data = b''.join(data[row * msg.step:row * msg.step + row_bytes] for row in range(height))
+    return SimpleNamespace(data=data, width=width, height=height), pix_fmt
+
+
+class RosVideoWriter:
+    def __init__(self, fps=25.0, rate=1.0, topic='', output_filename='',
+                 display=False, verbose=False, start=None, end=None):
+        self.fps, self.rate = positive_float(fps), positive_float(rate)
+        self.opt_topic, self.opt_out_file = topic, output_filename
+        self.opt_display_images, self.opt_verbose = display, verbose
+        self.opt_start, self.opt_end = start, end
+        self.opt_prefix = None
+        self._used_outputs = set()
+        self._reset_streams()
+
+    def _reset_streams(self):
+        self.t_first, self.t_video, self.t_file = {}, {}, {}
+        self.p_avconv, self._frames, self._formats = {}, {}, {}
 
     def parseArgs(self, args):
-        opts, opt_files = getopt.getopt(args,"hsvr:o:t:p:",["fps=","rate=","ofile=","topic=","start=","end=","prefix="])
-        for opt, arg in opts:
-            if opt == '-h':
-                print_help()
-                sys.exit(0)
-            elif opt == '-s':
-                self.opt_display_images = True
-            elif opt == '-v':
-                self.opt_verbose = True
-            elif opt in ("--fps"):
-                self.fps = float(arg)
-            elif opt in ("-r", "--rate"):
-                self.rate = float(arg)
-            elif opt in ("-o", "--ofile"):
-                self.opt_out_file = arg
-            elif opt in ("-t", "--topic"):
-                self.opt_topic = arg
-            elif opt in ("-p", "--prefix"):
-                self.opt_prefix = arg
-            elif opt in ("--start"):
-                self.opt_start = rospy.Time(int(arg))
-                if(self.opt_verbose):
-                    print("starting at",self.opt_start.to_sec())
-            elif opt in ("--end"):
-                self.opt_end = rospy.Time(int(arg))
-                if(self.opt_verbose):
-                    print("ending at",self.opt_end.to_sec())
-            else:
-                print("opz:", opt,'arg:', arg)
+        parser = make_parser()
+        options = parser.parse_args(args)
+        if options.start is not None and options.end is not None and options.end <= options.start:
+            parser.error('--end must be greater than --start')
+        if options.ofile and (not options.topic or len(options.bags) != 1):
+            parser.error('--ofile requires --topic and exactly one bag')
+        if options.prefix and len(options.bags) != 1:
+            parser.error('--prefix requires exactly one bag')
+        self.fps, self.rate = options.fps, options.rate
+        self.opt_out_file, self.opt_topic = options.ofile, options.topic
+        self.opt_prefix = options.prefix
+        self.opt_start, self.opt_end = options.start, options.end
+        self.opt_display_images, self.opt_verbose = options.s, options.v
+        return options.bags
 
-        if (self.fps<=0):
-            print("invalid fps", self.fps)
-            self.fps = 1
-
-        if (self.rate<=0):
-            print("invalid rate", self.rate)
-            self.rate = 1
-
-        if(self.opt_verbose):
-            print("using ",self.fps," FPS")
-        return opt_files
-
-
-    # filter messages using type or only the opic we whant from the 'topic' argument
     def filter_image_msgs(self, topic, datatype, md5sum, msg_def, header):
-        if(datatype=="sensor_msgs/CompressedImage"):
-            if (self.opt_topic != "" and self.opt_topic == topic) or self.opt_topic == "":
-                print("############# COMPRESSED IMAGE  ######################")
-                print(topic,' with datatype:', str(datatype))
-                print()
-                return True;
+        return (datatype in ('sensor_msgs/Image', 'sensor_msgs/CompressedImage') and
+                (not self.opt_topic or topic == self.opt_topic))
 
-        if(datatype=="theora_image_transport/Packet"):
-            if (self.opt_topic != "" and self.opt_topic == topic) or self.opt_topic == "":
-                print(topic,' with datatype:', str(datatype))
-                print('!!! theora is not supported, sorry !!!')
-                return False;
+    def _start_encoder(self, topic, msg, pix_fmt):
+        prefix = self.opt_prefix if self.opt_prefix is not None else str(Path(self._bagfile).with_suffix(''))
+        destination = Path(self.opt_out_file or (prefix + topic.replace('/', '_') + '.mp4'))
+        validate_paths(self._bagfile, destination)
+        key = destination.resolve()
+        if key in self._used_outputs:
+            raise ValueError(f'Multiple streams would overwrite the same output: {destination}')
+        self._used_outputs.add(key)
+        temporary = self._outputs.enter_context(atomic_output(destination))
+        command = [VIDEO_CONVERTER_TO_USE, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                   '-f', 'rawvideo', '-s', f'{msg.width}x{msg.height}', '-pix_fmt', pix_fmt,
+                   '-r', str(self.fps), '-i', '-', '-an', str(temporary)]
+        if self.opt_verbose:
+            print(f'Writing {topic} to {destination}')
+        self.p_avconv[topic] = subprocess.Popen(command, stdin=subprocess.PIPE)
+        self._formats[topic] = (msg.width, msg.height, pix_fmt)
 
-        if(datatype=="sensor_msgs/Image"):
-            if (self.opt_topic != "" and self.opt_topic == topic) or self.opt_topic == "":
-                print("############# UNCOMPRESSED IMAGE ######################")
-                print(topic,' with datatype:', str(datatype))
-                print()
-                return True;
-
-        return False;
-
-
-    def write_output_video(self, msg, topic, t, video_fmt, pix_fmt = ""):
-        # no data in this topic
-        if len(msg.data) == 0 :
-            return
-        # initiate data for this topic
-        if not topic in self.t_first :
-            self.t_first[topic] = t # timestamp of first image for this topic
-            self.t_video[topic] = 0
-            self.t_file[topic] = 0
-        # if multiple streams of images will start at different times the resulting video files will not be in sync
-        # current offset time we are in the bag file
-        self.t_file[topic] = (t-self.t_first[topic]).to_sec()
-        # fill video file up with images until we reache the current offset from the beginning of the bag file
-        while self.t_video[topic] < self.t_file[topic]/self.rate :
-            if not topic in self.p_avconv:
-                # we have to start a new process for this topic
-                if self.opt_verbose :
-                    print("Initializing pipe for topic", topic, "at time", t.to_sec())
-                if self.opt_out_file=="":
-                    out_file = self.opt_prefix + str(topic).replace("/", "_")+".mp4"
-                else:
-                    out_file = self.opt_out_file
-
-                if self.opt_verbose :
-                    print("Using output file ", out_file, " for topic ", topic, ".")
-
-                if video_fmt == MJPEG_VIDEO :
-                    cmd = [VIDEO_CONVERTER_TO_USE, '-v', '1', '-stats', '-r',str(self.fps),'-c','mjpeg','-f','mjpeg','-i','-','-an',out_file]
-                    self.p_avconv[topic] = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                    if self.opt_verbose :
-                        print("Using command line:")
-                        print(cmd)
-                elif video_fmt == RAWIMAGE_VIDEO :
-                    size = str(msg.width)+"x"+str(msg.height)
-                    cmd = [VIDEO_CONVERTER_TO_USE, '-v', '1', '-stats','-r',str(self.fps),'-f','rawvideo','-s',size,'-pix_fmt', pix_fmt,'-i','-','-an',out_file]
-                    self.p_avconv[topic] = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                    if self.opt_verbose :
-                        print("Using command line:")
-                        print(cmd)
-
-                else :
-                    print("Script error, unknown value for argument video_fmt in function write_output_video.")
-                    exit(1)
-            # send data to ffmpeg process pipe
+    def write_output_video(self, msg, topic, t, video_fmt, pix_fmt=''):
+        if video_fmt != RAWIMAGE_VIDEO:
+            raise ValueError('Images must be decoded before writing raw video')
+        if not msg.data:
+            raise ValueError(f'Empty image on {topic}')
+        timestamp = t.to_sec()
+        if not math.isfinite(timestamp):
+            raise ValueError('Image timestamp must be finite')
+        if topic not in self.t_first:
+            self._start_encoder(topic, msg, pix_fmt)
+            self.t_first[topic], self.t_file[topic] = timestamp, 0.0
             self.p_avconv[topic].stdin.write(msg.data)
-            # next frame time
-            self.t_video[topic] += 1.0/self.fps
+            self.t_video[topic] = 1  # Next output frame index; frame zero is written immediately.
+        else:
+            if self._formats[topic] != (msg.width, msg.height, pix_fmt):
+                raise ValueError(f'Image format changed on {topic}')
+            offset = (timestamp - self.t_first[topic]) / self.rate
+            if offset < self.t_file[topic]:
+                raise ValueError(f'Image timestamps went backwards on {topic}')
+            # Hold the preceding image between samples, rather than moving future frames backwards.
+            while self.t_video[topic] / self.fps < offset - 1e-9:
+                self.p_avconv[topic].stdin.write(self._frames[topic])
+                self.t_video[topic] += 1
+            if abs(self.t_video[topic] / self.fps - offset) <= 1e-9:
+                self.p_avconv[topic].stdin.write(msg.data)
+                self.t_video[topic] += 1
+            self.t_file[topic] = offset
+        self._frames[topic] = msg.data
+
+    def _close_encoders(self):
+        errors = []
+        for topic, process in self.p_avconv.items():
+            try:
+                try:
+                    process.stdin.close()
+                finally:
+                    try:
+                        code = process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                        raise RuntimeError(f'ffmpeg did not finish for {topic}')
+                if code:
+                    raise RuntimeError(f'ffmpeg failed for {topic} with exit code {code}')
+            except (OSError, RuntimeError) as error:
+                errors.append(str(error))
+        self.p_avconv.clear()
+        if errors:
+            raise RuntimeError('; '.join(errors))
 
     def addBag(self, filename):
-        if self.opt_display_images:
-            from cv_bridge import CvBridge, CvBridgeError
-            bridge = CvBridge()
-            cv_image = []
-
-        if self.opt_verbose :
-            print("Bagfile: {}".format(filename))
-
-        if not self.opt_prefix:
-            # create the output in the same folder and name as the bag file minu '.bag'
-            self.opt_prefix = bagfile[:-4]
-
-        #Go through the bag file
-        bag = rosbag.Bag(filename)
-        if self.opt_verbose :
-            print("Bag opened.")
-        # loop over all topics
-        for topic, msg, t in bag.read_messages(connection_filter=self.filter_image_msgs, start_time=self.opt_start, end_time=self.opt_end):
-            try:
-                if msg.format.find("jpeg")!=-1 :
-                    if msg.format.find("8")!=-1 and (msg.format.find("rgb")!=-1 or msg.format.find("bgr")!=-1 or msg.format.find("bgra")!=-1 ):
-                        if self.opt_display_images:
-                            np_arr = np.fromstring(msg.data, np.uint8)
-                            cv_image = cv2.imdecode(np_arr, cv2.CV_LOAD_IMAGE_COLOR)
-                        self.write_output_video( msg, topic, t, MJPEG_VIDEO )
-                    elif msg.format.find("mono8")!=-1 :
-                        if self.opt_display_images:
-                            np_arr = np.fromstring(msg.data, np.uint8)
-                            cv_image = cv2.imdecode(np_arr, cv2.CV_LOAD_IMAGE_COLOR)
-                        self.write_output_video( msg, topic, t, MJPEG_VIDEO )
-                    elif msg.format.find("16UC1")!=-1 :
-                        if self.opt_display_images:
-                            np_arr = np.fromstring(msg.data, np.uint16)
-                            cv_image = cv2.imdecode(np_arr, cv2.CV_LOAD_IMAGE_COLOR)
-                        self.write_output_video( msg, topic, t, MJPEG_VIDEO )
-                    else:
-                        print('unsupported jpeg format:', msg.format, '.', topic)
-
-            # has no attribute 'format'
-            except AttributeError:
+        if not Path(filename).is_file():
+            raise FileNotFoundError(f'Input file does not exist: {filename}')
+        if self.opt_out_file and not self.opt_topic:
+            raise ValueError('An explicit output filename requires a single --topic')
+        import rosbag
+        self._bagfile = filename
+        self._reset_streams()
+        read_options = {'connection_filter': self.filter_image_msgs}
+        if self.opt_start is not None or self.opt_end is not None:
+            import rospy
+            for key, value in [('start_time', self.opt_start), ('end_time', self.opt_end)]:
+                if value is not None:
+                    read_options[key] = value if hasattr(value, 'to_sec') else rospy.Time.from_sec(value)
+        count = 0
+        with ExitStack() as self._outputs:
+            with rosbag.Bag(str(filename), 'r') as bag:
                 try:
-                        pix_fmt=None
-                        if msg.encoding.find("mono8")!=-1 or msg.encoding.find("8UC1")!=-1:
-                            pix_fmt = "gray"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
+                    for topic, msg, timestamp in bag.read_messages(**read_options):
+                        frame, pix_fmt = prepare_image(msg)
+                        self.write_output_video(frame, topic, timestamp, RAWIMAGE_VIDEO, pix_fmt)
+                        count += 1
+                        if self.opt_display_images:
+                            import cv2
+                            from cv_bridge import CvBridge
+                            bridge = CvBridge()
+                            image = (bridge.compressed_imgmsg_to_cv2(msg, 'bgr8') if hasattr(msg, 'format')
+                                     else bridge.imgmsg_to_cv2(msg, 'bgr8'))
+                            cv2.imshow(topic, image)
+                            if cv2.waitKey(1) & 0xFF == 27:
+                                raise RuntimeError('Video export cancelled')
+                    if count == 0:
+                        raise ValueError(f'No supported image messages found in {filename}')
+                finally:
+                    try:
+                        self._close_encoders()
+                    finally:
+                        if self.opt_display_images:
+                            import cv2
+                            cv2.destroyAllWindows()
+        return count
 
-                        elif msg.encoding.find("bgra")!=-1 :
-                            pix_fmt = "bgra"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
 
-                        elif msg.encoding.find("bgr8")!=-1 :
-                            pix_fmt = "bgr24"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
-                        elif msg.encoding.find("bggr8")!=-1 :
-                            pix_fmt = "bayer_bggr8"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bayer_bggr8")
-                        elif msg.encoding.find("rggb8")!=-1 :
-                            pix_fmt = "bayer_rggb8"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bayer_rggb8")
-                        elif msg.encoding.find("rgb8")!=-1 :
-                            pix_fmt = "rgb24"
-                            if self.opt_display_images:
-                                cv_image = bridge.imgmsg_to_cv2(msg, "bgr8")
-                        elif msg.encoding.find("16UC1")!=-1 :
-                            pix_fmt = "gray16le"
-                        elif msg.encoding.find('yuv422')!=-1 :
-                            np_arr = np.fromstring(msg.data, np.uint8)
-                            mat = np.reshape(np_arr, (480,640,2))
-                            cv_image = cv2.cvtColor(mat, cv2.COLOR_YUV2BGR_UYVY)
-                            msg.data = cv_image.tostring()
-                            pix_fmt = 'bgr24'
-                        else:
-                            print('unsupported encoding:', msg.encoding, topic)
-                            #exit(1)
-                        if pix_fmt:
-                            self.write_output_video( msg, topic, t, RAWIMAGE_VIDEO, pix_fmt )
-
-                except AttributeError:
-                    # maybe theora packet
-                    # theora not supported
-                    if self.opt_verbose :
-                        print("Could not handle this format. Maybe thoera packet? theora is not supported.")
-                    pass
-            if self.opt_display_images:
-                cv2.imshow(topic, cv_image)
-                key=cv2.waitKey(1)
-                if key==1048603:
-                    exit(1)
-        if self.p_avconv == {}:
-            print("No image topics found in bag:", filename)
-        bag.close()
-
+def main(argv=None):
+    import sys
+    writer = RosVideoWriter()
+    bags = writer.parseArgs(sys.argv[1:] if argv is None else argv)
+    # Check every input before starting any output.
+    for filename in bags:
+        if not Path(filename).is_file():
+            raise FileNotFoundError(f'Input file does not exist: {filename}')
+        for other in bags:
+            if writer.opt_out_file and Path(writer.opt_out_file).resolve() == Path(other).resolve():
+                raise ValueError('Output must not overwrite an input bag')
+    for filename in bags:
+        writer.addBag(filename)
+    print('Video export finished')
 
 
 if __name__ == '__main__':
-    #print()
-    #print('rosbag2video, by Maximilian Laiacker 2020 and Abel Gabor 2019')
-    #print()
-
-    if len(sys.argv) < 2:
-        print('Please specify ros bag file(s)!')
-        print_help()
-        sys.exit(1)
-    else :
-        videowriter = RosVideoWriter()
-        try:
-            opt_files = videowriter.parseArgs(sys.argv[1:])
-        except getopt.GetoptError:
-            print_help()
-            sys.exit(2)
-
-
-    # loop over all files
-    for files in range(0,len(opt_files)):
-        #First arg is the bag to look at
-        bagfile = opt_files[files]
-        videowriter.addBag(bagfile)
-    print("finished")
+    main()

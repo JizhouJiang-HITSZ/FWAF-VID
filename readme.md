@@ -23,6 +23,12 @@ If this dataset is useful to your work, please include the following citation:
 }
 ```
 
+## Related research
+
+Interested in flapping-wing aerial vehicle research? Take a look at **[Sparrowhawk](https://github.com/JizhouJiang-HITSZ/sparrowhawk)**, our compact flapping-wing robot for autonomous narrow-gap traversal. The project page presents the mechanical design, onboard sensing, vision-based control framework, and flight experiments from our paper:
+
+**[A Compact Autonomous Flapping-Wing Aerial Vehicle: Design, Modeling, and Vision-Based Control for Narrow Gap Traversal](https://doi.org/10.1109/TII.2025.3628640)**, *IEEE Transactions on Industrial Informatics*, vol. 22, no. 2, pp. 1562–1573, February 2026.
+
 ## Video 
 
 [Video1: Overall introduction of FWAF-VID](https://youtu.be/NfSLNcAVUO4)

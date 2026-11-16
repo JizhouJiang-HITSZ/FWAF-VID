@@ -1,8 +1,10 @@
-import pandas as pd
-import numpy as np
-from pykalman import KalmanFilter
+import argparse
+from pathlib import Path
+
+from file_utils import atomic_output, validate_paths
 
 def kalman_filter(data, transition_covariance, observation_covariance):
+    from pykalman import KalmanFilter
     # Initialize Kalman filter
     kf = KalmanFilter(initial_state_mean=data[0], n_dim_obs=1, transition_covariance=transition_covariance, observation_covariance=observation_covariance)
     
@@ -22,8 +24,12 @@ def write_tum_data(path, original_data, smoothed_data):
         f.close()
 
 def main(input_file, output_file):
-    # Load TUM format data
-    df = pd.read_csv(input_file, header=None, delimiter=' ', comment='#')
+    validate_paths(input_file, output_file)
+    import numpy as np
+    import pandas as pd
+    df = pd.read_csv(input_file, header=None, sep=r'\s+', comment='#')
+    if df.empty or df.shape[1] != 8 or not np.isfinite(df.to_numpy(dtype=float)).all():
+        raise ValueError('Expected nonempty TUM data with eight finite numeric columns')
 
     # Extract the second, third, fourth, and fifth columns
     selected_columns = df.iloc[:, [1, 2, 3, 4, 5, 6, 7]]
@@ -34,12 +40,18 @@ def main(input_file, output_file):
     smoothed_data = np.apply_along_axis(kalman_filter, axis=0, arr=selected_columns.values, transition_covariance=transition_covariance, observation_covariance=observation_covariance)
 
     # Save the smoothed results to the output file in TUM format
-    write_tum_data(output_file, df.values, smoothed_data)
+    with atomic_output(output_file) as temporary:
+        write_tum_data(temporary, df.values, smoothed_data)
     print(f"Kalman filtering completed. Results saved to {output_file}")
 
-if __name__ == "__main__":
-    input_file = "gt_14.tum"  # Replace with your TUM format file
-    output_file = "stamped_groundtruth.txt"  # Replace with the desired output file name
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description='Apply the existing Kalman filter to a TUM trajectory')
+    parser.add_argument('-i', '--input', required=True)
+    parser.add_argument('-o', '--output')
+    args = parser.parse_args(argv)
+    output = args.output or str(Path(args.input).with_name(Path(args.input).stem + '_filtered.tum'))
+    main(args.input, output)
 
-    main(input_file, output_file)
 
+if __name__ == '__main__':
+    cli()

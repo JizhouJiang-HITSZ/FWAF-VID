@@ -4,7 +4,7 @@ The **FWAF-VID dataset** is described in our paper, **“FWAF-VID: A Flapping-Wi
 
 [Read the paper on IEEE Xplore](https://ieeexplore.ieee.org/abstract/document/10965497) | [DOI: 10.1109/LRA.2025.3560856](https://doi.org/10.1109/LRA.2025.3560856)
 
-Created by Jizhou Jiang, you can contact me through E-mail：22B953004@stu.hit.edu.cn
+Created by Jizhou Jiang.
 
 If this dataset is useful to your work, please include the following citation:
 

@@ -1,23 +1,26 @@
 # FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization  
 
-The detailed features of the **FWAF-VID dataset** can be found in our paper: **“FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization    ”** by Jizhou Jiang, Erzhen Pan, Wenfu Xu, Wei Sun, and Jingyang Ye, which has accepted for RA-L.
+The **FWAF-VID dataset** is described in our paper, **“FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization”**, by Jizhou Jiang, Erzhen Pan, Wenfu Xu, Wei Sun, and Jingyang Ye, published in *IEEE Robotics and Automation Letters*, vol. 10, no. 6, pp. 6328–6335, June 2025.
 
-[FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization | IEEE Journals & Magazine | IEEE Xplore]([FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization | IEEE Journals & Magazine | IEEE Xplore](https://ieeexplore.ieee.org/document/10965497/authors#authors))
+[Read the paper on IEEE Xplore](https://ieeexplore.ieee.org/abstract/document/10965497) | [DOI: 10.1109/LRA.2025.3560856](https://doi.org/10.1109/LRA.2025.3560856)
 
 Created by Jizhou Jiang, you can contact me through E-mail：22B953004@stu.hit.edu.cn
 
 If this dataset is useful to your work, please include the following citation:
 
-```
+```bibtex
 @ARTICLE{10965497,
   author={Jiang, Jizhou and Pan, Erzhen and Xu, Wenfu and Sun, Wei and Ye, Jingyang},
-  journal={IEEE Robotics and Automation Letters}, 
-  title={FWAF-VID: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization}, 
+  journal={IEEE Robotics and Automation Letters},
+  title={{FWAF-VID}: A Flapping-Wing Aggressive Flight Benchmark Dataset for Visual-Inertial Localization},
   year={2025},
   volume={10},
   number={6},
-  pages={6328-6335},
-  doi={10.1109/LRA.2025.3560856}}
+  pages={6328--6335},
+  month=jun,
+  doi={10.1109/LRA.2025.3560856},
+  url={https://ieeexplore.ieee.org/abstract/document/10965497}
+}
 ```
 
 ## Video 
